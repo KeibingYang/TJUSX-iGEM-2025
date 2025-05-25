@@ -1,104 +1,67 @@
-import base64
-from openai import OpenAI
-import os
-import random
+import pandas as pd
+import openai
 import json
-import requests
+import re
+import time
 
+# 这里不要改，我已经开好了对应的api key了
 API_BASE = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-api_key = ""
+api_key = "sk-8e64d4093070449d88bc3ccd91d40992"  # 请替换为你的 API 密钥
+client = openai.OpenAI(api_key=api_key, base_url=API_BASE)
 
-client = OpenAI(
-    api_key=api_key,
-    base_url=API_BASE,  # 关键：指定自定义 API 地址
-)
-
-
-def encode_image(image_path):
-    with open(image_path, "rb") as image_file:
-        return base64.b64encode(image_file.read()).decode("utf-8")
-
-
-# 一共是5个选项，这部分专门针对good选项，就按照之前设计的几个选项，最后加入no defect即可。
-def random_options():
-    options = ["color","scratch","crush","texture","dirty"]
-    selected = random.sample(options, 4)
-    selected.append("no defect")
-    random.shuffle(selected)
-    return selected
+# 这里需要根据自己的数据路径进行更改，其实只要能够读到对应的菌株名称就好了
+excel_file = "dataset\问答\菌株问答机器人数据库模板.xlsx"
+try:
+    df = pd.read_excel(excel_file)
+    strains = df["菌株名称"].dropna().unique().tolist()
+except Exception as e:
+    print(f"无法读取Excel文件: {e}")
+    exit()
 
 
-# 因为存在combined，所以这里就是以异常文件夹为最小单位，每次跑之前都需要需要大家手动修改一下，
-folder_path = r"Defect_Spectrum\DS-DAGM\good"
-# 自定义就可以，不需要别的，最后返回给我一个该文件夹目录下总的cot json文件即可。
-output_path = os.path.join(folder_path, "noqa_results.jsonl")  # 写成 .jsonl
+def extract_json_from_response(response: str) -> dict:
+    try:
+        cleaned = re.sub(r"```json|```", "", response).strip()
+        
+        first_brace = cleaned.find("{")
+        last_brace = cleaned.rfind("}")
+        if first_brace == -1 or last_brace == -1:
+            raise ValueError("未找到有效的 JSON 内容")
+        json_str = cleaned[first_brace:last_brace + 1]
 
-for root, dirs, files in os.walk(folder_path):
+        return json.loads(json_str)
+    except Exception as e:
+        return {"error": "无法解析模型输出", "原始输出": response}
 
-    for filename in files:
-        if filename.lower().endswith(('.jpg', '.jpeg', '.png')):
-            num, _ = os.path.splitext(filename)
-            image_path = os.path.join(folder_path, filename)
-            image_path = image_path.replace(os.sep, '/')
-            json_path = os.path.join(folder_path, num + '.json')
-            json_path = json_path.replace(os.sep, '/')
-            base64_image = encode_image(image_path)
 
-            select_options = random_options()
-            answer_index = select_options.index("no defect")
-            answer_letter = chr(65 + answer_index)
+def query_strain_info(strain_name: str) -> dict:
+    prompt = f"请以结构化 JSON 格式详细介绍菌株 {strain_name} 的全部专业信息"
+    prompt = prompt + "，字段包括：菌株名称、可治疗疾病、生长特性、存活能力评级、粘附/留存能力评级、外形特征、与其他菌种协同情况、是否影响肠道健康、产生的代谢物、潜在致病性/副作用、代谢途径及优势劣势、微生物相互作用、竞争性抑制情况、疾病关联性、培养周期、培养成本、基因表达变化情况、遗传稳定性、临床实验/使用案例、文献链接/专家推荐。请返回标准JSON字符串。"
+    print(f"正在提问：{strain_name}")
+    print(f"当前的prompt是{prompt}") # 这两个是调试的，也不用改，到时候会看到很明显的输出
+    try:
+        completion = client.chat.completions.create(
+            model="qwen-plus", # 这里需要改，我是随便用的
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7
+        )
+        response = completion.choices[0].message.content
+        return extract_json_from_response(response)
+    except Exception as e:
+        return {"error": str(e)}
 
-            defect_options = "(A)" + select_options[0] + "(B)" + select_options[1] + \
-                             "(C)" + select_options[2] + "(D)" + select_options[3] + "(E)" + select_options[4]
+results = {}
+for name in strains:
+    if name == "Azospirillum lipoferum": #这里改成需要停止的菌株名字就好了
+        break
+    print('-'*80)
+    info = query_strain_info(name)
+    results[name] = info
+    print(f"{name}的答案：{results[name]}")
+    print('-'*80)
+    time.sleep(2)  # 这里是防止他过快的提问，如果后面确定了模型就可以直接去掉了
 
-            prompt = "Which of the following options correctly identifies the defects in the image?"
-            prompt = prompt + "(A)" + select_options[0]
-            prompt = prompt + "(B)" + select_options[1]
-            prompt = prompt + "(C)" + select_options[2]
-            prompt = prompt + "(D)" + select_options[3]
-            prompt = prompt + "(E)" + select_options[4]
-            prompt = prompt + ",The correct answer is " + answer_letter + "."
-            prompt += " Begin with \"The answer is " + "\"(X = option), then immediately "
-            prompt += "state \"The defect type is " + "no defect" + "\", appending an explanation.Analyze the entire image to support your judgment.For each incorrect option, provide a rejection reason citing specific missing features and append \"Likely cause:\" with a explanation.No paragraph breaks, and avoid connectors."
+with open("菌株详细信息汇总.json", "w", encoding="utf-8") as f:
+    json.dump(results, f, ensure_ascii=False, indent=2)
 
-            print(prompt)
-
-            completion = client.chat.completions.create(
-                model="qwen-vl-max",
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/jpeg;base64,{base64_image}",
-                                },
-                            },
-                        ],
-                    }
-                ],
-            )
-
-            results = {
-                "image_path": image_path,
-                "coordinates": "NULL",
-                "type": "no defect",
-                "conversation": {
-                    "Question": prompt,
-                    "options": {
-                        "A": select_options[0],
-                        "B": select_options[1],
-                        "C": select_options[2],
-                        "D": select_options[3],
-                        "E": select_options[4],
-                    },
-                    "Reasoning": completion.choices[0].message.content,
-                    "Answer": "(" + answer_letter + ")" + "no defect"
-                },
-            }
-            print(results)
-            # ✅ 写入 JSONL（每行为一个 JSON 对象）
-            with open(output_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(results, ensure_ascii=False) + "\n")
+print("✅ 所有菌株信息已完成提问并保存为 JSON。")
